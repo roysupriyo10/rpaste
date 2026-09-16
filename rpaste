@@ -18,8 +18,25 @@ ensure_dirs() { mkdir -p "$RPASTE_IMAGES"; }
 timestamp() { date +%Y%m%d-%H%M%S; }
 
 ssh_source_ip() {
-  local ip="${SSH_CONNECTION%% *}"
-  [ -n "$ip" ] || die "not in an SSH session (SSH_CONNECTION unset)"
+  # Prefer the utmpx database (via `who`) — it reflects the current TTY's
+  # actual SSH session, not the possibly-stale inherited $SSH_CONNECTION.
+  local cur_tty
+  cur_tty=$(tty 2>/dev/null | sed 's|/dev/||') || true
+  if [ -n "$cur_tty" ] && [ "$cur_tty" != "not a tty" ]; then
+    local ip
+    ip=$(who | awk -v t="$cur_tty" '$2 == t {gsub(/[()]/, "", $NF); print $NF; exit}')
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+  fi
+  # No TTY (e.g. called from a pipe/shim) — try most recent SSH login from `who`
+  local ip
+  ip=$(who | awk '/\(/ {gsub(/[()]/, "", $NF); ip=$NF} END {if (ip) print ip}')
+  if [ -n "$ip" ]; then
+    printf '%s' "$ip"
+    return
+  fi
+  # Last resort: inherited env var (may be stale)
+  ip="${SSH_CONNECTION%% *}"
+  [ -n "$ip" ] || die "not in an SSH session"
   printf '%s' "$ip"
 }
 
