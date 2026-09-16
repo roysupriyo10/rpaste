@@ -468,7 +468,14 @@ cmd_install() {
       ;;
   esac
 
-  # 3. Verify SSH reverse access (if in an SSH session)
+  # 3. Build and install the pasteboard dylib (macOS only)
+  case "$(uname -s)" in
+    Darwin)
+      cmd_inject_build "$bin_dir"
+      ;;
+  esac
+
+  # 4. Verify SSH reverse access (if in an SSH session)
   if [ -n "${SSH_CONNECTION:-}" ]; then
     local ip host
     ip=$(ssh_source_ip)
@@ -495,6 +502,61 @@ cmd_install() {
   fi
 
   info "done. run 'rpaste status' to verify."
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: inject-build
+# Compile the DYLD_INSERT_LIBRARIES dylib for macOS pasteboard interception.
+# ---------------------------------------------------------------------------
+
+cmd_inject_build() {
+  [ "$(uname -s)" = "Darwin" ] || { info "inject-build is macOS only"; return 0; }
+
+  local rpaste_dir
+  rpaste_dir=$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")")
+  local src="$rpaste_dir/rpaste-inject.m"
+  local lib_dir="$RPASTE_STATE"
+  local dylib="$lib_dir/rpaste-inject.dylib"
+
+  mkdir -p "$lib_dir"
+
+  if [ ! -f "$src" ]; then
+    info "rpaste-inject.m not found (skip dylib build)"
+    return 0
+  fi
+
+  if [ -f "$dylib" ] && [ "$dylib" -nt "$src" ]; then
+    info "dylib up to date: $dylib"
+  else
+    info "building dylib..."
+    if clang -shared -framework AppKit -o "$dylib" "$src" 2>/dev/null; then
+      info "built: $dylib"
+    else
+      info "warning: dylib build failed (Xcode CLT required)"
+      return 0
+    fi
+  fi
+
+  # Create a claude wrapper that loads the dylib
+  local bin_dir="${1:-$HOME/.local/bin}"
+  local real_claude
+  real_claude=$(PATH="${PATH/$bin_dir:/}" command -v claude 2>/dev/null || echo "")
+  if [ -z "$real_claude" ]; then
+    info "claude not found in PATH — skip wrapper"
+    return 0
+  fi
+  # Don't wrap if already wrapped
+  if [ -L "$bin_dir/claude" ] || grep -q 'rpaste-inject' "$bin_dir/claude" 2>/dev/null; then
+    info "claude wrapper already installed"
+    return 0
+  fi
+
+  info "to enable Ctrl+V image paste, launch claude with:"
+  info "  DYLD_INSERT_LIBRARIES=$dylib claude"
+  info ""
+  info "or add to your shell profile:"
+  info "  export RPASTE_DYLIB=\"$dylib\""
+  info "  alias claude='DYLD_INSERT_LIBRARIES=\"\$RPASTE_DYLIB\" command claude'"
 }
 
 # ---------------------------------------------------------------------------
@@ -548,6 +610,7 @@ cmd="$1"; shift
 
 case "$cmd" in
   install)      cmd_install "$@" ;;
+  inject-build) cmd_inject_build "$@" ;;
   get)          cmd_get "$@" ;;
   stage)        cmd_stage "$@" ;;
   pull)         cmd_pull "$@" ;;
