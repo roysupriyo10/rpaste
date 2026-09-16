@@ -15,25 +15,27 @@ You (local)                              Agent (remote)
   clipboard image                          rpaste paste
   ←── ssh rpaste get ──────────────────→   pulls image bytes
                                            stages to ~/.local/state/rpaste/
-                                           prints path
+                                           agent reads via shim / dylib
 ```
 
 `rpaste` is one script that does different things depending on where it runs:
 
 - **On your local machine** (`rpaste get`): extracts the clipboard image, writes to stdout
-- **On the remote** (`rpaste paste`): SSHes back to your machine, runs `rpaste get`, stages the image, prints the path
+- **On the remote** (`rpaste paste`): SSHes back to your machine, runs `rpaste get`, stages the image
 
-On Linux remotes, an xclip shim makes agents' native Ctrl+V work transparently.
+How agents receive the image depends on the remote OS:
+
+| Remote OS | Mechanism | Why |
+|-----------|-----------|-----|
+| Linux | xclip shim | `Bun.Image.fromClipboard()` returns null on Linux, so Claude Code falls back to calling `xclip` from PATH. A symlink named `xclip` pointing to rpaste intercepts the call and serves the staged image. |
+| macOS | DYLD injection | Claude Code calls `NSPasteboard` directly (in-process, native Obj-C). The macOS pasteboard is inaccessible from SSH sessions (per-session bootstrap namespace). A small dylib loaded via `DYLD_INSERT_LIBRARIES` swizzles `NSPasteboard` to fall back to the staged image when the real pasteboard is empty. |
 
 ## Install
 
 Get rpaste on **both** your local machine and your remotes:
 
 ```bash
-# copy it
-cp rpaste ~/.local/bin/rpaste
-
-# or clone and link
+# clone and link
 git clone https://github.com/roysupriyo10/rpaste.git
 ln -s $(pwd)/rpaste/rpaste ~/.local/bin/rpaste
 ```
@@ -46,9 +48,11 @@ rpaste install
 
 This will:
 - Link rpaste into your PATH
-- Install the xclip shim (Linux only — makes Ctrl+V work in agents)
-- Check for clipboard tool dependencies
+- **Linux**: install the xclip shim symlink
+- **macOS**: build the NSPasteboard dylib and add a shell profile snippet that loads it in SSH sessions
 - Verify reverse SSH access back to your local machine
+
+No wrappers, no aliases — you launch `claude` normally.
 
 ### Dependencies
 
@@ -56,11 +60,13 @@ This will:
 
 | OS | Tool | Install |
 |----|------|---------|
-| macOS | `pngpaste` (optional, osascript fallback exists) | `brew install pngpaste` |
+| macOS | `pngpaste` (optional, swift fallback exists) | `brew install pngpaste` |
 | Linux (Wayland) | `wl-paste` | Usually pre-installed |
 | Linux (X11) | `xclip` | `sudo apt install xclip` |
 
-**Remote machine:** Nothing besides `rpaste` itself, `ssh`, and `bash`.
+**macOS remote:** Xcode Command Line Tools (for building the dylib).
+
+**Linux remote:** Nothing besides `rpaste` itself, `ssh`, and `bash`.
 
 ### Requirements
 
@@ -74,31 +80,22 @@ This will:
 # 2. On the remote:
 rpaste paste
 
-# 3. Use the image:
-#    - Linux: Ctrl+V in agent (xclip shim serves it)
-#    - macOS: paste the printed path into the agent
-#    - Any:   reference ~/.local/state/rpaste/images/latest.png
+# 3. Ctrl+V in the agent — the image is available
 ```
 
 ## Commands
 
 ```
-rpaste install          One-time setup: link into PATH, install shims, check deps
+rpaste install          One-time setup
+rpaste uninstall        Remove shims, DYLD snippet, and PATH link
 rpaste get              Extract clipboard image → stdout
-rpaste paste [host]     Pull clipboard from SSH source, stage locally, print path
+rpaste paste [host]     Pull clipboard from SSH source, stage, make available
 rpaste status           Show current state
 rpaste clean [N]        Remove old staged images (keep N, default 10)
-rpaste shim-install     Install xclip shim (called by install on Linux)
+rpaste inject-build     Build the NSPasteboard dylib (macOS, called by install)
+rpaste inject-env       Print the shell profile snippet (macOS)
+rpaste shim-install     Install xclip shim (Linux, called by install)
 ```
-
-## How agents receive the image
-
-| Agent | Remote OS | Method |
-|-------|-----------|--------|
-| Claude Code | Linux | Ctrl+V via xclip shim (transparent) |
-| Claude Code | macOS | Paste the printed path into the prompt |
-| Kiro CLI | any | `/paste` or paste the path |
-| Other agents | any | Paste the path |
 
 ## Terminal agnostic
 

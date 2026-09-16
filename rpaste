@@ -17,15 +17,12 @@ ensure_dirs() { mkdir -p "$RPASTE_IMAGES"; }
 
 timestamp() { date +%Y%m%d-%H%M%S; }
 
-# Return the SSH source host IP (the machine you're sitting at).
 ssh_source_ip() {
-  # SSH_CONNECTION: client_ip client_port server_ip server_port
   local ip="${SSH_CONNECTION%% *}"
   [ -n "$ip" ] || die "not in an SSH session (SSH_CONNECTION unset)"
   printf '%s' "$ip"
 }
 
-# Resolve a Tailscale IP to its hostname, falling back to the raw IP.
 resolve_host() {
   local ip=$1
   if command -v tailscale >/dev/null 2>&1; then
@@ -51,14 +48,10 @@ latest_image() {
   [ -f "$img" ] && printf '%s' "$img"
 }
 
-# Write text to the system clipboard via OSC 52 escape sequence.
-# Works over SSH and through tmux (with allow-passthrough on).
 _osc52_copy() {
   local text=$1
   local encoded
   encoded=$(printf '%s' "$text" | base64 | tr -d '\n')
-  # Write directly to the TTY so escape sequences reach the terminal
-  # even when stdout is captured by an agent or pipe.
   local tty_target="${SSH_TTY:-/dev/tty}"
   if [ -n "${TMUX:-}" ]; then
     printf '\ePtmux;\e\e]52;c;%s\a\e\\' "$encoded" > "$tty_target" 2>/dev/null || true
@@ -75,9 +68,6 @@ _osc52_copy() {
 cmd_get() {
   case "$(uname -s)" in
     Darwin)
-      # On macOS, the pasteboard belongs to the GUI (console) user.
-      # If we're a different user (e.g. SSH'd as rs10 but GUI is rs10figr),
-      # delegate to the console user.
       local console_user
       console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
       if [ -n "$console_user" ] && [ "$console_user" != "$(whoami)" ]; then
@@ -150,8 +140,6 @@ cmd_pull() {
   fi
   info "pulling clipboard from $host"
 
-  # Try rpaste in PATH first, fall back to common install locations.
-  # Non-interactive SSH often doesn't source shell profiles.
   local remote_cmd='
     if command -v rpaste >/dev/null 2>&1; then rpaste get
     elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
@@ -174,16 +162,13 @@ cmd_paste() {
   local host="${1:-}"
   local img
   img=$(cmd_pull "$host")
-  # Put the image path on the text clipboard via OSC 52.
-  # Cmd+V in the terminal pastes this path as text.
-  # Claude Code detects .png paths and attaches the image automatically.
   _osc52_copy "$img"
-  info "path copied to clipboard — Cmd+V to paste"
+  info "image staged — Ctrl+V to paste into agent"
 }
 
 # ---------------------------------------------------------------------------
 # Subcommand: serve
-# Act as an xclip shim. Called when agents invoke xclip to read the clipboard.
+# Act as an xclip shim (Linux). Called when symlinked as 'xclip'.
 # ---------------------------------------------------------------------------
 
 cmd_serve() {
@@ -192,7 +177,6 @@ cmd_serve() {
   local type=""
   local selection=""
 
-  # Parse xclip-compatible arguments
   local i=0
   while [ $i -lt ${#args[@]} ]; do
     case "${args[$i]}" in
@@ -220,7 +204,6 @@ cmd_serve() {
         cat "$img"
         ;;
       text/plain|"")
-        # Fall through to real xclip for text if available
         local real_xclip
         real_xclip=$(_find_real_xclip) || { printf ''; exit 0; }
         "$real_xclip" "$@"
@@ -230,98 +213,17 @@ cmd_serve() {
         ;;
     esac
   elif [ "$mode" = "in" ]; then
-    # For clipboard writes, pass through to real xclip
     local real_xclip
     real_xclip=$(_find_real_xclip) || exit 0
     "$real_xclip" "$@"
   else
-    # No mode specified — pass through
     local real_xclip
     real_xclip=$(_find_real_xclip) || exit 0
     "$real_xclip" "$@"
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Subcommand: serve-osascript
-# Act as an osascript shim. Intercepts clipboard image reads that Claude Code
-# makes; everything else passes through to /usr/bin/osascript.
-# ---------------------------------------------------------------------------
-
-cmd_serve_osascript() {
-  local args="$*"
-
-  # Only intercept clipboard reads. Everything else → /usr/bin/osascript.
-  case "$args" in
-    *'clipboard as'*'class PNGf'*|*'clipboard as'*'class TIFF'*|*'clipboard as'*'class furl'*)
-      _osascript_serve_image "$@"
-      ;;
-    *'clipboard info'*)
-      local img
-      img=$(_osascript_ensure_image)
-      if [ -n "$img" ]; then
-        local size
-        size=$(wc -c < "$img" | tr -d ' ')
-        printf '«class PNGf», %s\n' "$size"
-        exit 0
-      fi
-      /usr/bin/osascript "$@"
-      ;;
-    *)
-      /usr/bin/osascript "$@"
-      ;;
-  esac
-}
-
-_osascript_ensure_image() {
-  local img="$RPASTE_IMAGES/latest.png"
-  if [ -f "$img" ]; then
-    printf '%s' "$img"
-    return 0
-  fi
-  # Auto-pull from SSH source if possible
-  if [ -n "${SSH_CONNECTION:-}" ]; then
-    ensure_dirs
-    local ip="${SSH_CONNECTION%% *}"
-    local host
-    host=$(resolve_host "$ip")
-    local remote_cmd='
-      if command -v rpaste >/dev/null 2>&1; then rpaste get
-      elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
-      else exit 1
-      fi
-    '
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$remote_cmd" 2>/dev/null > "$RPASTE_IMAGES/latest.png"; then
-      if [ -s "$RPASTE_IMAGES/latest.png" ]; then
-        printf '%s' "$RPASTE_IMAGES/latest.png"
-        return 0
-      fi
-    fi
-    rm -f "$RPASTE_IMAGES/latest.png"
-  fi
-  return 1
-}
-
-_osascript_serve_image() {
-  local img
-  img=$(_osascript_ensure_image) || { /usr/bin/osascript "$@"; return; }
-
-  # Claude Code's saveImage writes to a temp file via osascript.
-  # Find that output path in the arguments and copy the image there.
-  local outpath
-  outpath=$(printf '%s' "$*" | grep -oE 'POSIX file "[^"]+"' | head -1 | sed 's/POSIX file "//;s/"$//' || true)
-  if [ -n "$outpath" ]; then
-    cp "$img" "$outpath" 2>/dev/null
-    exit 0
-  fi
-
-  # checkImage call — just needs to succeed (exit 0) to signal image exists.
-  # Claude Code checks exit code, not output.
-  exit 0
-}
-
 _find_real_xclip() {
-  # Find the real xclip, skipping ourselves
   local self
   self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
   local p
@@ -335,7 +237,7 @@ _find_real_xclip() {
 
 # ---------------------------------------------------------------------------
 # Subcommand: shim-install
-# Install xclip shim symlink on the current machine.
+# Install xclip shim symlink on Linux.
 # ---------------------------------------------------------------------------
 
 cmd_shim_install() {
@@ -347,12 +249,12 @@ cmd_shim_install() {
   case "$(uname -s)" in
     Linux)
       _install_shim "$bin_dir" "$self" xclip
+      info "ensure $bin_dir is before /usr/bin in PATH"
       ;;
     Darwin)
-      _install_shim "$bin_dir" "$self" osascript
+      info "no shim needed on macOS (DYLD injection handles NSPasteboard)"
       ;;
   esac
-  info "ensure $bin_dir is before /usr/bin in PATH"
 }
 
 _install_shim() {
@@ -367,8 +269,91 @@ _install_shim() {
 }
 
 # ---------------------------------------------------------------------------
+# Subcommand: inject-build
+# Compile the DYLD_INSERT_LIBRARIES dylib for macOS NSPasteboard interception.
+# ---------------------------------------------------------------------------
+
+cmd_inject_build() {
+  [ "$(uname -s)" = "Darwin" ] || { info "inject-build is macOS only"; return 0; }
+
+  local rpaste_dir
+  rpaste_dir=$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")")
+  local src="$rpaste_dir/rpaste-inject.m"
+  local dylib="$RPASTE_STATE/rpaste-inject.dylib"
+
+  mkdir -p "$RPASTE_STATE"
+
+  if [ ! -f "$src" ]; then
+    info "rpaste-inject.m not found (skip dylib build)"
+    return 0
+  fi
+
+  if [ -f "$dylib" ] && [ "$dylib" -nt "$src" ]; then
+    info "dylib up to date: $dylib"
+  else
+    info "building dylib..."
+    if clang -shared -framework AppKit -o "$dylib" "$src" 2>/dev/null; then
+      info "built: $dylib"
+    else
+      info "warning: dylib build failed (Xcode CLT required)"
+      return 0
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: inject-env
+# Print the shell snippet that loads the dylib in SSH sessions.
+# ---------------------------------------------------------------------------
+
+cmd_inject_env() {
+  cat <<'EOF'
+# rpaste — load NSPasteboard shim in SSH sessions (added by rpaste install)
+if [ -n "${SSH_CONNECTION:-}" ] && [ -f "${XDG_STATE_HOME:-$HOME/.local/state}/rpaste/rpaste-inject.dylib" ]; then
+  export DYLD_INSERT_LIBRARIES="${XDG_STATE_HOME:-$HOME/.local/state}/rpaste/rpaste-inject.dylib${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}"
+fi
+EOF
+}
+
+_RPASTE_PROFILE_MARKER="# rpaste — load NSPasteboard shim in SSH sessions"
+
+_inject_env_install() {
+  local dylib="$RPASTE_STATE/rpaste-inject.dylib"
+  [ -f "$dylib" ] || return 0
+
+  local snippet
+  snippet=$(cmd_inject_env)
+
+  local rc="$HOME/.zshrc"
+  [ -f "$rc" ] || rc="$HOME/.bashrc"
+  [ -f "$rc" ] || rc="$HOME/.zshrc"
+
+  if grep -qF "$_RPASTE_PROFILE_MARKER" "$rc" 2>/dev/null; then
+    info "shell profile already has DYLD snippet ($rc)"
+  else
+    printf '\n%s\n' "$snippet" >> "$rc"
+    info "added DYLD snippet to $rc"
+  fi
+}
+
+_inject_env_remove() {
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    [ -f "$rc" ] || continue
+    if grep -qF "$_RPASTE_PROFILE_MARKER" "$rc" 2>/dev/null; then
+      local tmp="$rc.rpaste-bak"
+      # Remove the marker line and the following 3 lines (the if/export/fi block)
+      awk -v marker="$_RPASTE_PROFILE_MARKER" '
+        $0 ~ marker { skip=4; next }
+        skip > 0 { skip--; next }
+        { print }
+      ' "$rc" > "$tmp" && mv "$tmp" "$rc"
+      info "removed DYLD snippet from $rc"
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
 # Subcommand: status
-# Show current rpaste state.
 # ---------------------------------------------------------------------------
 
 cmd_status() {
@@ -390,22 +375,35 @@ cmd_status() {
   else
     printf 'ssh source:       (not in SSH session)\n'
   fi
-  printf 'shim installed:   '
-  local shim_name
   case "$(uname -s)" in
-    Linux) shim_name="xclip" ;;
-    Darwin) shim_name="osascript" ;;
+    Linux)
+      printf 'xclip shim:       '
+      if [ -L "$HOME/.local/bin/xclip" ]; then
+        printf 'yes (%s)\n' "$(readlink "$HOME/.local/bin/xclip")"
+      else
+        printf 'no\n'
+      fi
+      ;;
+    Darwin)
+      printf 'dylib:            '
+      local dylib="$RPASTE_STATE/rpaste-inject.dylib"
+      if [ -f "$dylib" ]; then
+        printf '%s\n' "$dylib"
+      else
+        printf '(not built)\n'
+      fi
+      printf 'DYLD active:      '
+      if [ -n "${DYLD_INSERT_LIBRARIES:-}" ] && printf '%s' "$DYLD_INSERT_LIBRARIES" | grep -q rpaste-inject; then
+        printf 'yes\n'
+      else
+        printf 'no\n'
+      fi
+      ;;
   esac
-  if [ -n "$shim_name" ] && [ -L "$HOME/.local/bin/$shim_name" ]; then
-    printf 'yes (%s → %s)\n' "$shim_name" "$(readlink "$HOME/.local/bin/$shim_name")"
-  else
-    printf 'no\n'
-  fi
 }
 
 # ---------------------------------------------------------------------------
 # Subcommand: clean
-# Remove old staged images, keeping the N most recent.
 # ---------------------------------------------------------------------------
 
 cmd_clean() {
@@ -422,8 +420,6 @@ cmd_clean() {
 
 # ---------------------------------------------------------------------------
 # Subcommand: install
-# One-time setup: link into PATH, install shim on Linux, create state dirs,
-# check dependencies.
 # ---------------------------------------------------------------------------
 
 cmd_install() {
@@ -446,36 +442,19 @@ cmd_install() {
   # 2. Platform-specific setup
   case "$(uname -s)" in
     Linux)
-      # Install xclip shim for transparent agent Ctrl+V
       cmd_shim_install "$bin_dir"
-      # Check clipboard tool
       if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        if ! command -v wl-paste >/dev/null 2>&1; then
-          info "warning: wl-paste not found (needed for clipboard on Wayland)"
-          info "  install: sudo apt install wl-clipboard  (or equivalent)"
-        fi
-      else
-        # Check for real xclip (not our shim)
-        local real_xclip
-        if ! real_xclip=$(_find_real_xclip) 2>/dev/null; then
-          info "note: no real xclip found (shim handles image paste; text paste may need xclip)"
-          info "  install: sudo apt install xclip  (or equivalent)"
-        fi
+        command -v wl-paste >/dev/null 2>&1 \
+          || info "warning: wl-paste not found (sudo apt install wl-clipboard)"
       fi
       ;;
     Darwin)
-      cmd_shim_install "$bin_dir"
+      cmd_inject_build
+      _inject_env_install
       ;;
   esac
 
-  # 3. Build and install the pasteboard dylib (macOS only)
-  case "$(uname -s)" in
-    Darwin)
-      cmd_inject_build "$bin_dir"
-      ;;
-  esac
-
-  # 4. Verify SSH reverse access (if in an SSH session)
+  # 3. Verify SSH reverse access (if in an SSH session)
   if [ -n "${SSH_CONNECTION:-}" ]; then
     local ip host
     ip=$(ssh_source_ip)
@@ -484,7 +463,6 @@ cmd_install() {
     info "testing reverse SSH..."
     if ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" 'echo ok' >/dev/null 2>&1; then
       info "reverse SSH to $host: ok"
-      # Check if rpaste exists on source
       if ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" '
         command -v rpaste >/dev/null 2>&1 || [ -x "$HOME/.local/bin/rpaste" ]
       ' 2>/dev/null; then
@@ -505,58 +483,38 @@ cmd_install() {
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand: inject-build
-# Compile the DYLD_INSERT_LIBRARIES dylib for macOS pasteboard interception.
+# Subcommand: uninstall
 # ---------------------------------------------------------------------------
 
-cmd_inject_build() {
-  [ "$(uname -s)" = "Darwin" ] || { info "inject-build is macOS only"; return 0; }
+cmd_uninstall() {
+  local bin_dir="${1:-$HOME/.local/bin}"
 
-  local rpaste_dir
-  rpaste_dir=$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")")
-  local src="$rpaste_dir/rpaste-inject.m"
-  local lib_dir="$RPASTE_STATE"
-  local dylib="$lib_dir/rpaste-inject.dylib"
-
-  mkdir -p "$lib_dir"
-
-  if [ ! -f "$src" ]; then
-    info "rpaste-inject.m not found (skip dylib build)"
-    return 0
-  fi
-
-  if [ -f "$dylib" ] && [ "$dylib" -nt "$src" ]; then
-    info "dylib up to date: $dylib"
-  else
-    info "building dylib..."
-    if clang -shared -framework AppKit -o "$dylib" "$src" 2>/dev/null; then
-      info "built: $dylib"
-    else
-      info "warning: dylib build failed (Xcode CLT required)"
-      return 0
+  # Remove xclip shim
+  if [ -L "$bin_dir/xclip" ]; then
+    local target
+    target=$(realpath "$bin_dir/xclip" 2>/dev/null || readlink -f "$bin_dir/xclip" 2>/dev/null || echo "")
+    local self
+    self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+    if [ "$target" = "$self" ]; then
+      rm -f "$bin_dir/xclip"
+      info "removed xclip shim"
+      if [ -f "$bin_dir/xclip.real" ]; then
+        mv "$bin_dir/xclip.real" "$bin_dir/xclip"
+        info "restored original xclip"
+      fi
     fi
   fi
 
-  # Create a claude wrapper that loads the dylib
-  local bin_dir="${1:-$HOME/.local/bin}"
-  local real_claude
-  real_claude=$(PATH="${PATH/$bin_dir:/}" command -v claude 2>/dev/null || echo "")
-  if [ -z "$real_claude" ]; then
-    info "claude not found in PATH — skip wrapper"
-    return 0
-  fi
-  # Don't wrap if already wrapped
-  if [ -L "$bin_dir/claude" ] || grep -q 'rpaste-inject' "$bin_dir/claude" 2>/dev/null; then
-    info "claude wrapper already installed"
-    return 0
+  # Remove DYLD snippet from shell profile
+  _inject_env_remove
+
+  # Remove rpaste link (but not the repo itself)
+  if [ -L "$bin_dir/rpaste" ]; then
+    rm -f "$bin_dir/rpaste"
+    info "removed rpaste from $bin_dir"
   fi
 
-  info "to enable Ctrl+V image paste, launch claude with:"
-  info "  DYLD_INSERT_LIBRARIES=$dylib claude"
-  info ""
-  info "or add to your shell profile:"
-  info "  export RPASTE_DYLIB=\"$dylib\""
-  info "  alias claude='DYLD_INSERT_LIBRARIES=\"\$RPASTE_DYLIB\" command claude'"
+  info "uninstalled. state dir left at $RPASTE_STATE (remove manually if desired)."
 }
 
 # ---------------------------------------------------------------------------
@@ -570,38 +528,39 @@ rpaste — content bridge for pasting images into terminal agents over SSH
 Usage: rpaste <command> [args]
 
 Commands:
-  install          One-time setup: link into PATH, install shims, check deps
+  install          One-time setup: link into PATH, build dylib, install shims
+  uninstall        Remove shims, DYLD snippet, and PATH link
   get              Extract clipboard image → stdout (run on machine with display)
   stage            Read image from stdin → staging dir, print path
-  pull [host]      Pull clipboard image from SSH source (or given host) → stage locally
-  paste [host]     Alias for pull (pull + stage, print path)
-  serve [args]     Act as xclip shim (for Linux remotes)
-  shim-install     Install xclip shim symlink in ~/.local/bin
+  pull [host]      Pull clipboard image from SSH source (or given host) → stage
+  paste [host]     Pull + stage + copy path to text clipboard
+  serve [args]     Act as xclip shim (called when symlinked as xclip)
+  shim-install     Install xclip shim symlink (Linux only)
+  inject-build     Build the NSPasteboard dylib (macOS only)
+  inject-env       Print shell snippet for loading the dylib
   status           Show rpaste state
   clean [N]        Remove old staged images, keeping N most recent (default 10)
+
+How it works:
+  macOS remote:  DYLD_INSERT_LIBRARIES loads a dylib that makes NSPasteboard
+                 fall back to rpaste's staged image when the real pasteboard
+                 is empty. Set automatically in SSH sessions by rpaste install.
+  Linux remote:  xclip shim symlink intercepts clipboard reads and serves
+                 the staged image. Bun.Image returns null on Linux, so
+                 Claude Code falls back to xclip which hits the shim.
 
 Workflow:
   1. Copy/screenshot an image on your local machine
   2. On the remote: rpaste paste
-  3. Use the image:
-     - Linux: Ctrl+V in agent (xclip shim serves it)
-     - macOS: paste the printed path into the agent
-     - Any:   reference ~/.local/state/rpaste/images/latest.png
-
-For Linux remotes, install the xclip shim for transparent Ctrl+V:
-  rpaste shim-install
+  3. Ctrl+V in the agent — the image is available
 EOF
   exit 1
 }
 
-# Handle being called as a shim (symlink named 'xclip' or 'osascript' pointing to rpaste)
+# Handle being called as xclip shim (symlink named 'xclip' pointing to rpaste)
 called_as=$(basename "$0")
 if [ "$called_as" = "xclip" ]; then
   cmd_serve "$@"
-  exit $?
-fi
-if [ "$called_as" = "osascript" ]; then
-  cmd_serve_osascript "$@"
   exit $?
 fi
 
@@ -610,13 +569,15 @@ cmd="$1"; shift
 
 case "$cmd" in
   install)      cmd_install "$@" ;;
-  inject-build) cmd_inject_build "$@" ;;
+  uninstall)    cmd_uninstall "$@" ;;
   get)          cmd_get "$@" ;;
   stage)        cmd_stage "$@" ;;
   pull)         cmd_pull "$@" ;;
   paste)        cmd_paste "$@" ;;
   serve)        cmd_serve "$@" ;;
   shim-install) cmd_shim_install "$@" ;;
+  inject-build) cmd_inject_build "$@" ;;
+  inject-env)   cmd_inject_env "$@" ;;
   status)       cmd_status "$@" ;;
   clean)        cmd_clean "$@" ;;
   -h|--help|help) usage ;;
