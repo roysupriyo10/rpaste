@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# rpaste — content bridge for pasting images into terminal agents over SSH.
+# https://github.com/roysupriyo10/rpaste
+set -euo pipefail
+
+RPASTE_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/rpaste"
+RPASTE_IMAGES="$RPASTE_STATE/images"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die()  { printf 'rpaste: %s\n' "$*" >&2; exit 1; }
+info() { printf 'rpaste: %s\n' "$*" >&2; }
+
+ensure_dirs() { mkdir -p "$RPASTE_IMAGES"; }
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+# Return the SSH source host IP (the machine you're sitting at).
+ssh_source_ip() {
+  # SSH_CONNECTION: client_ip client_port server_ip server_port
+  local ip="${SSH_CONNECTION%% *}"
+  [ -n "$ip" ] || die "not in an SSH session (SSH_CONNECTION unset)"
+  printf '%s' "$ip"
+}
+
+# Resolve a Tailscale IP to its hostname, falling back to the raw IP.
+resolve_host() {
+  local ip=$1
+  if command -v tailscale >/dev/null 2>&1; then
+    local name
+    name=$(tailscale status --json 2>/dev/null \
+      | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for k, v in d.get('Peer', {}).items():
+    for a in v.get('TailscaleIPs', []):
+        if a == '$ip':
+            print(v['HostName']); sys.exit(0)
+for a in d.get('Self', {}).get('TailscaleIPs', []):
+    if a == '$ip':
+        print(d['Self']['HostName']); sys.exit(0)
+" 2>/dev/null) && [ -n "$name" ] && { printf '%s' "$name"; return; }
+  fi
+  printf '%s' "$ip"
+}
+
+# Detect the process running in the current tmux pane.
+pane_process() {
+  tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: get
+# Extract clipboard image on the LOCAL machine, write to stdout.
+# ---------------------------------------------------------------------------
+
+cmd_get() {
+  case "$(uname -s)" in
+    Darwin)
+      if command -v pngpaste >/dev/null 2>&1; then
+        pngpaste - 2>/dev/null || die "no image in clipboard (pngpaste)"
+      else
+        # osascript fallback — write to temp, cat, clean up
+        local tmp
+        tmp=$(mktemp /tmp/rpaste-get-XXXXXX.png)
+        osascript -e '
+          try
+            set png to (the clipboard as «class PNGf»)
+            set f to open for access POSIX file "'"$tmp"'" with write permission
+            write png to f
+            close access f
+          on error
+            do shell script "rm -f '"$tmp"'"
+            error "no image in clipboard"
+          end try
+        ' 2>/dev/null || { rm -f "$tmp"; die "no image in clipboard (osascript)"; }
+        cat "$tmp"
+        rm -f "$tmp"
+      fi
+      ;;
+    Linux)
+      if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        wl-paste -t image/png 2>/dev/null || die "no image in clipboard (wl-paste)"
+      else
+        xclip -selection clipboard -t image/png -o 2>/dev/null || die "no image in clipboard (xclip)"
+      fi
+      ;;
+    *)
+      die "unsupported OS: $(uname -s)"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: stage
+# Save stdin (image bytes) to the staging directory.
+# Returns the path to the staged file.
+# ---------------------------------------------------------------------------
+
+cmd_stage() {
+  ensure_dirs
+  local name="clipboard-$(timestamp).png"
+  local dest="$RPASTE_IMAGES/$name"
+  cat > "$dest"
+  [ -s "$dest" ] || { rm -f "$dest"; die "staged file is empty"; }
+  ln -sf "$dest" "$RPASTE_IMAGES/latest.png"
+  printf '%s' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: pull
+# SSH back to the source machine, run `rpaste get`, stage locally.
+# ---------------------------------------------------------------------------
+
+cmd_pull() {
+  local host="${1:-}"
+  if [ -z "$host" ]; then
+    local ip
+    ip=$(ssh_source_ip)
+    host=$(resolve_host "$ip")
+  fi
+  info "pulling clipboard from $host"
+
+  # Try rpaste in PATH first, fall back to common install locations.
+  # Non-interactive SSH often doesn't source shell profiles.
+  local remote_cmd='
+    if command -v rpaste >/dev/null 2>&1; then rpaste get
+    elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
+    else echo "rpaste: not found on remote" >&2; exit 1
+    fi
+  '
+  local dest
+  dest=$(ssh "$host" "$remote_cmd" 2>/dev/null | cmd_stage) \
+    || die "failed to pull clipboard from $host"
+  info "staged: $dest"
+  printf '%s' "$dest"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: inject
+# Send the staged image reference into the current tmux pane.
+# ---------------------------------------------------------------------------
+
+cmd_inject() {
+  local img="${1:-$RPASTE_IMAGES/latest.png}"
+  [ -f "$img" ] || die "no staged image: $img"
+
+  local proc
+  proc=$(pane_process)
+
+  case "$proc" in
+    claude)
+      # Claude Code on macOS can't read clipboard over SSH; inject path directly.
+      # Single-quoted path triggers file attachment.
+      tmux send-keys "'$img'" Enter
+      ;;
+    kiro-cli|kiro)
+      tmux send-keys "/paste" Enter
+      ;;
+    node)
+      # Agent CLIs often show as 'node' — try Ctrl+V first (xclip shim handles it on Linux).
+      if [ "$(uname -s)" = "Linux" ]; then
+        tmux send-keys C-v
+      else
+        tmux send-keys "'$img'" Enter
+      fi
+      ;;
+    *)
+      # Generic: just send the path
+      tmux send-keys "'$img'" Enter
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: paste
+# Full flow: pull from source + inject into current pane.
+# ---------------------------------------------------------------------------
+
+cmd_paste() {
+  local host="${1:-}"
+  local img
+  img=$(cmd_pull "$host")
+  cmd_inject "$img"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: serve
+# Act as an xclip shim. Called when agents invoke xclip to read the clipboard.
+# ---------------------------------------------------------------------------
+
+cmd_serve() {
+  local args=("$@")
+  local mode=""
+  local type=""
+  local selection=""
+
+  # Parse xclip-compatible arguments
+  local i=0
+  while [ $i -lt ${#args[@]} ]; do
+    case "${args[$i]}" in
+      -o) mode="out" ;;
+      -i) mode="in" ;;
+      -t) i=$((i + 1)); type="${args[$i]:-}" ;;
+      -selection) i=$((i + 1)); selection="${args[$i]:-}" ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [ "$mode" = "out" ]; then
+    case "$type" in
+      TARGETS)
+        local img="$RPASTE_IMAGES/latest.png"
+        if [ -f "$img" ]; then
+          printf 'TARGETS\nimage/png\ntext/plain\n'
+        else
+          printf 'TARGETS\ntext/plain\n'
+        fi
+        ;;
+      image/png|image/jpeg|image/jpg|image/gif|image/webp|image/bmp)
+        local img="$RPASTE_IMAGES/latest.png"
+        [ -f "$img" ] || exit 1
+        cat "$img"
+        ;;
+      text/plain|"")
+        # Fall through to real xclip for text if available
+        local real_xclip
+        real_xclip=$(_find_real_xclip) || { printf ''; exit 0; }
+        "$real_xclip" "$@"
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+  elif [ "$mode" = "in" ]; then
+    # For clipboard writes, pass through to real xclip
+    local real_xclip
+    real_xclip=$(_find_real_xclip) || exit 0
+    "$real_xclip" "$@"
+  else
+    # No mode specified — pass through
+    local real_xclip
+    real_xclip=$(_find_real_xclip) || exit 0
+    "$real_xclip" "$@"
+  fi
+}
+
+_find_real_xclip() {
+  # Find the real xclip, skipping ourselves
+  local self
+  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
+  local p
+  while IFS= read -r p; do
+    local real
+    real=$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null || echo "$p")
+    [ "$real" != "$self" ] && { printf '%s' "$p"; return 0; }
+  done < <(which -a xclip 2>/dev/null)
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: shim-install
+# Install xclip shim symlink on the current machine.
+# ---------------------------------------------------------------------------
+
+cmd_shim_install() {
+  local bin_dir="${1:-$HOME/.local/bin}"
+  local self
+  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+  mkdir -p "$bin_dir"
+
+  if [ "$(uname -s)" = "Linux" ]; then
+    local target="$bin_dir/xclip"
+    if [ -e "$target" ] && [ "$(realpath "$target" 2>/dev/null)" != "$self" ]; then
+      info "backing up existing $target → ${target}.real"
+      mv "$target" "${target}.real"
+    fi
+    ln -sf "$self" "$target"
+    info "installed xclip shim: $target → $self"
+    info "ensure $bin_dir is before /usr/bin in PATH"
+  else
+    info "shim not needed on macOS (Claude Code uses osascript, not xclip)"
+    info "use 'rpaste paste' or bind prefix+V in tmux instead"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: status
+# Show current rpaste state.
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+  printf 'rpaste state dir: %s\n' "$RPASTE_STATE"
+  if [ -f "$RPASTE_IMAGES/latest.png" ]; then
+    local size
+    size=$(wc -c < "$RPASTE_IMAGES/latest.png" | tr -d ' ')
+    local target
+    target=$(readlink "$RPASTE_IMAGES/latest.png" 2>/dev/null || echo "?")
+    printf 'latest image:     %s (%s bytes)\n' "$target" "$size"
+  else
+    printf 'latest image:     (none)\n'
+  fi
+  printf 'platform:         %s\n' "$(uname -s)"
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    local ip
+    ip=$(ssh_source_ip)
+    printf 'ssh source:       %s (%s)\n' "$(resolve_host "$ip")" "$ip"
+  else
+    printf 'ssh source:       (not in SSH session)\n'
+  fi
+  printf 'shim installed:   '
+  if [ -L "$HOME/.local/bin/xclip" ]; then
+    printf 'yes (%s)\n' "$(readlink "$HOME/.local/bin/xclip")"
+  else
+    printf 'no\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: clean
+# Remove old staged images, keeping the N most recent.
+# ---------------------------------------------------------------------------
+
+cmd_clean() {
+  local keep="${1:-10}"
+  ensure_dirs
+  local count=0
+  while IFS= read -r f; do
+    [ "$f" = "$RPASTE_IMAGES/latest.png" ] && continue
+    rm -f "$f"
+    count=$((count + 1))
+  done < <(ls -1t "$RPASTE_IMAGES"/clipboard-*.png 2>/dev/null | tail -n +$((keep + 1)))
+  info "cleaned $count old images (keeping $keep)"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<'EOF'
+rpaste — content bridge for pasting images into terminal agents over SSH
+
+Usage: rpaste <command> [args]
+
+Commands:
+  get              Extract clipboard image → stdout (run on machine with display)
+  stage            Read image from stdin → staging dir, print path
+  pull [host]      Pull clipboard image from SSH source (or given host) → stage locally
+  inject [path]    Send staged image ref into current tmux pane's agent
+  paste [host]     Full flow: pull + inject (bind this to prefix+V)
+  serve [args]     Act as xclip shim (for Linux remotes)
+  shim-install     Install xclip shim symlink in ~/.local/bin
+  status           Show rpaste state
+  clean [N]        Remove old staged images, keeping N most recent (default 10)
+
+The typical SSH workflow:
+  1. Copy/screenshot an image on your local machine
+  2. On the remote (in tmux): rpaste paste
+     — or bind it: bind V run-shell "rpaste paste"
+
+For Linux remotes, install the xclip shim for transparent Ctrl+V:
+  rpaste shim-install
+EOF
+  exit 1
+}
+
+# Handle being called as an xclip shim (symlink named 'xclip' pointing to rpaste)
+called_as=$(basename "$0")
+if [ "$called_as" = "xclip" ]; then
+  cmd_serve "$@"
+  exit $?
+fi
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+
+case "$cmd" in
+  get)          cmd_get "$@" ;;
+  stage)        cmd_stage "$@" ;;
+  pull)         cmd_pull "$@" ;;
+  inject)       cmd_inject "$@" ;;
+  paste)        cmd_paste "$@" ;;
+  serve)        cmd_serve "$@" ;;
+  shim-install) cmd_shim_install "$@" ;;
+  status)       cmd_status "$@" ;;
+  clean)        cmd_clean "$@" ;;
+  -h|--help|help) usage ;;
+  *)            die "unknown command: $cmd (try rpaste --help)" ;;
+esac
