@@ -60,24 +60,15 @@ cmd_get() {
   case "$(uname -s)" in
     Darwin)
       if command -v pngpaste >/dev/null 2>&1; then
-        pngpaste - 2>/dev/null || die "no image in clipboard (pngpaste)"
+        pngpaste - 2>/dev/null || die "no image in clipboard"
       else
-        # osascript fallback — write to temp, cat, clean up
-        local tmp
-        tmp=$(mktemp /tmp/rpaste-get-XXXXXX.png)
-        osascript -e '
-          try
-            set png to (the clipboard as «class PNGf»)
-            set f to open for access POSIX file "'"$tmp"'" with write permission
-            write png to f
-            close access f
-          on error
-            do shell script "rm -f '"$tmp"'"
-            error "no image in clipboard"
-          end try
-        ' 2>/dev/null || { rm -f "$tmp"; die "no image in clipboard (osascript)"; }
-        cat "$tmp"
-        rm -f "$tmp"
+        swift -e '
+          import AppKit
+          guard let data = NSPasteboard.general.data(forType: .png) else {
+            fputs("rpaste: no image in clipboard\n", stderr); exit(1)
+          }
+          FileHandle.standardOutput.write(data)
+        ' 2>/dev/null || die "no image in clipboard"
       fi
       ;;
     Linux)
@@ -341,10 +332,7 @@ cmd_install() {
       fi
       ;;
     Darwin)
-      if ! command -v pngpaste >/dev/null 2>&1; then
-        info "note: pngpaste not found (using osascript fallback, which is slower)"
-        info "  install: brew install pngpaste"
-      fi
+      # Swift + AppKit handles clipboard natively; pngpaste is optional (faster).
       ;;
   esac
 
