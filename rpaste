@@ -51,6 +51,22 @@ latest_image() {
   [ -f "$img" ] && printf '%s' "$img"
 }
 
+# Write text to the system clipboard via OSC 52 escape sequence.
+# Works over SSH and through tmux (with allow-passthrough on).
+_osc52_copy() {
+  local text=$1
+  local encoded
+  encoded=$(printf '%s' "$text" | base64 | tr -d '\n')
+  # Write directly to the TTY so escape sequences reach the terminal
+  # even when stdout is captured by an agent or pipe.
+  local tty_target="${SSH_TTY:-/dev/tty}"
+  if [ -n "${TMUX:-}" ]; then
+    printf '\ePtmux;\e\e]52;c;%s\a\e\\' "$encoded" > "$tty_target" 2>/dev/null || true
+  else
+    printf '\e]52;c;%s\a' "$encoded" > "$tty_target" 2>/dev/null || true
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Subcommand: get
 # Extract clipboard image on the LOCAL machine, write to stdout.
@@ -59,6 +75,26 @@ latest_image() {
 cmd_get() {
   case "$(uname -s)" in
     Darwin)
+      # On macOS, the pasteboard belongs to the GUI (console) user.
+      # If we're a different user (e.g. SSH'd as rs10 but GUI is rs10figr),
+      # delegate to the console user.
+      local console_user
+      console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+      if [ -n "$console_user" ] && [ "$console_user" != "$(whoami)" ]; then
+        local gui_host
+        gui_host=$(hostname -s 2>/dev/null || hostname)
+        local gui_cmd='
+          if command -v rpaste >/dev/null 2>&1; then rpaste get
+          elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
+          else echo "rpaste: not found" >&2; exit 1
+          fi
+        '
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$console_user@$gui_host" "$gui_cmd" 2>/dev/null \
+          || ssh -o BatchMode=yes -o ConnectTimeout=5 "$console_user@localhost" "$gui_cmd" 2>/dev/null \
+          || die "cannot reach GUI user $console_user"
+        return
+      fi
+
       if command -v pngpaste >/dev/null 2>&1; then
         pngpaste - 2>/dev/null || die "no image in clipboard"
       else
@@ -136,7 +172,13 @@ cmd_pull() {
 
 cmd_paste() {
   local host="${1:-}"
-  cmd_pull "$host"
+  local img
+  img=$(cmd_pull "$host")
+  # Put the image path on the text clipboard via OSC 52.
+  # Cmd+V in the terminal pastes this path as text.
+  # Claude Code detects .png paths and attaches the image automatically.
+  _osc52_copy "$img"
+  info "path copied to clipboard — Cmd+V to paste"
 }
 
 # ---------------------------------------------------------------------------
@@ -200,6 +242,84 @@ cmd_serve() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Subcommand: serve-osascript
+# Act as an osascript shim. Intercepts clipboard image reads that Claude Code
+# makes; everything else passes through to /usr/bin/osascript.
+# ---------------------------------------------------------------------------
+
+cmd_serve_osascript() {
+  local args="$*"
+
+  # Only intercept clipboard reads. Everything else → /usr/bin/osascript.
+  case "$args" in
+    *'clipboard as'*'class PNGf'*|*'clipboard as'*'class TIFF'*|*'clipboard as'*'class furl'*)
+      _osascript_serve_image "$@"
+      ;;
+    *'clipboard info'*)
+      local img
+      img=$(_osascript_ensure_image)
+      if [ -n "$img" ]; then
+        local size
+        size=$(wc -c < "$img" | tr -d ' ')
+        printf '«class PNGf», %s\n' "$size"
+        exit 0
+      fi
+      /usr/bin/osascript "$@"
+      ;;
+    *)
+      /usr/bin/osascript "$@"
+      ;;
+  esac
+}
+
+_osascript_ensure_image() {
+  local img="$RPASTE_IMAGES/latest.png"
+  if [ -f "$img" ]; then
+    printf '%s' "$img"
+    return 0
+  fi
+  # Auto-pull from SSH source if possible
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    ensure_dirs
+    local ip="${SSH_CONNECTION%% *}"
+    local host
+    host=$(resolve_host "$ip")
+    local remote_cmd='
+      if command -v rpaste >/dev/null 2>&1; then rpaste get
+      elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
+      else exit 1
+      fi
+    '
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$remote_cmd" 2>/dev/null > "$RPASTE_IMAGES/latest.png"; then
+      if [ -s "$RPASTE_IMAGES/latest.png" ]; then
+        printf '%s' "$RPASTE_IMAGES/latest.png"
+        return 0
+      fi
+    fi
+    rm -f "$RPASTE_IMAGES/latest.png"
+  fi
+  return 1
+}
+
+_osascript_serve_image() {
+  local img
+  img=$(_osascript_ensure_image) || { /usr/bin/osascript "$@"; return; }
+
+  # Claude Code's saveImage writes to a temp file via osascript.
+  # Find that output path in the arguments and copy the image there.
+  local outpath
+  outpath=$(printf '%s' "$*" | grep -oE 'POSIX file "[^"]+"' | head -1 | sed 's/POSIX file "//;s/"$//' || true)
+  if [ -n "$outpath" ]; then
+    cp "$img" "$outpath" 2>/dev/null
+    exit 0
+  fi
+
+  # checkImage call — just needs to succeed (exit 0) to signal image exists.
+  # Claude Code checks exit code, not output.
+  exit 0
+}
+
 _find_real_xclip() {
   # Find the real xclip, skipping ourselves
   local self
@@ -224,19 +344,26 @@ cmd_shim_install() {
   self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
   mkdir -p "$bin_dir"
 
-  if [ "$(uname -s)" = "Linux" ]; then
-    local target="$bin_dir/xclip"
-    if [ -e "$target" ] && [ "$(realpath "$target" 2>/dev/null)" != "$self" ]; then
-      info "backing up existing $target → ${target}.real"
-      mv "$target" "${target}.real"
-    fi
-    ln -sf "$self" "$target"
-    info "installed xclip shim: $target → $self"
-    info "ensure $bin_dir is before /usr/bin in PATH"
-  else
-    info "shim not needed on macOS (Claude Code uses osascript, not xclip)"
-    info "use 'rpaste paste' or bind prefix+V in tmux instead"
+  case "$(uname -s)" in
+    Linux)
+      _install_shim "$bin_dir" "$self" xclip
+      ;;
+    Darwin)
+      _install_shim "$bin_dir" "$self" osascript
+      ;;
+  esac
+  info "ensure $bin_dir is before /usr/bin in PATH"
+}
+
+_install_shim() {
+  local bin_dir=$1 self=$2 name=$3
+  local target="$bin_dir/$name"
+  if [ -e "$target" ] && [ "$(realpath "$target" 2>/dev/null)" != "$self" ]; then
+    info "backing up existing $target → ${target}.real"
+    mv "$target" "${target}.real"
   fi
+  ln -sf "$self" "$target"
+  info "installed $name shim: $target → $self"
 }
 
 # ---------------------------------------------------------------------------
@@ -264,8 +391,13 @@ cmd_status() {
     printf 'ssh source:       (not in SSH session)\n'
   fi
   printf 'shim installed:   '
-  if [ -L "$HOME/.local/bin/xclip" ]; then
-    printf 'yes (%s)\n' "$(readlink "$HOME/.local/bin/xclip")"
+  local shim_name
+  case "$(uname -s)" in
+    Linux) shim_name="xclip" ;;
+    Darwin) shim_name="osascript" ;;
+  esac
+  if [ -n "$shim_name" ] && [ -L "$HOME/.local/bin/$shim_name" ]; then
+    printf 'yes (%s → %s)\n' "$shim_name" "$(readlink "$HOME/.local/bin/$shim_name")"
   else
     printf 'no\n'
   fi
@@ -332,7 +464,7 @@ cmd_install() {
       fi
       ;;
     Darwin)
-      # Swift + AppKit handles clipboard natively; pngpaste is optional (faster).
+      cmd_shim_install "$bin_dir"
       ;;
   esac
 
@@ -400,10 +532,14 @@ EOF
   exit 1
 }
 
-# Handle being called as an xclip shim (symlink named 'xclip' pointing to rpaste)
+# Handle being called as a shim (symlink named 'xclip' or 'osascript' pointing to rpaste)
 called_as=$(basename "$0")
 if [ "$called_as" = "xclip" ]; then
   cmd_serve "$@"
+  exit $?
+fi
+if [ "$called_as" = "osascript" ]; then
+  cmd_serve_osascript "$@"
   exit $?
 fi
 
