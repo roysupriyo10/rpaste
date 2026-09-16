@@ -46,9 +46,9 @@ for a in d.get('Self', {}).get('TailscaleIPs', []):
   printf '%s' "$ip"
 }
 
-# Detect the process running in the current tmux pane.
-pane_process() {
-  tmux display-message -p '#{pane_current_command}' 2>/dev/null || echo ""
+latest_image() {
+  local img="$RPASTE_IMAGES/latest.png"
+  [ -f "$img" ] && printf '%s' "$img"
 }
 
 # ---------------------------------------------------------------------------
@@ -139,51 +139,13 @@ cmd_pull() {
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand: inject
-# Send the staged image reference into the current tmux pane.
-# ---------------------------------------------------------------------------
-
-cmd_inject() {
-  local img="${1:-$RPASTE_IMAGES/latest.png}"
-  [ -f "$img" ] || die "no staged image: $img"
-
-  local proc
-  proc=$(pane_process)
-
-  case "$proc" in
-    claude)
-      # Claude Code on macOS can't read clipboard over SSH; inject path directly.
-      # Single-quoted path triggers file attachment.
-      tmux send-keys "'$img'" Enter
-      ;;
-    kiro-cli|kiro)
-      tmux send-keys "/paste" Enter
-      ;;
-    node)
-      # Agent CLIs often show as 'node' — try Ctrl+V first (xclip shim handles it on Linux).
-      if [ "$(uname -s)" = "Linux" ]; then
-        tmux send-keys C-v
-      else
-        tmux send-keys "'$img'" Enter
-      fi
-      ;;
-    *)
-      # Generic: just send the path
-      tmux send-keys "'$img'" Enter
-      ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
 # Subcommand: paste
-# Full flow: pull from source + inject into current pane.
+# Full flow: pull from source, stage, print path.
 # ---------------------------------------------------------------------------
 
 cmd_paste() {
   local host="${1:-}"
-  local img
-  img=$(cmd_pull "$host")
-  cmd_inject "$img"
+  cmd_pull "$host"
 }
 
 # ---------------------------------------------------------------------------
@@ -336,6 +298,86 @@ cmd_clean() {
 }
 
 # ---------------------------------------------------------------------------
+# Subcommand: install
+# One-time setup: link into PATH, install shim on Linux, create state dirs,
+# check dependencies.
+# ---------------------------------------------------------------------------
+
+cmd_install() {
+  local bin_dir="${1:-$HOME/.local/bin}"
+  local self
+  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+
+  ensure_dirs
+
+  # 1. Link rpaste into PATH
+  mkdir -p "$bin_dir"
+  local link="$bin_dir/rpaste"
+  if [ -L "$link" ] && [ "$(realpath "$link" 2>/dev/null)" = "$self" ]; then
+    info "rpaste already in $bin_dir"
+  else
+    ln -sf "$self" "$link"
+    info "linked: $link → $self"
+  fi
+
+  # 2. Platform-specific setup
+  case "$(uname -s)" in
+    Linux)
+      # Install xclip shim for transparent agent Ctrl+V
+      cmd_shim_install "$bin_dir"
+      # Check clipboard tool
+      if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        if ! command -v wl-paste >/dev/null 2>&1; then
+          info "warning: wl-paste not found (needed for clipboard on Wayland)"
+          info "  install: sudo apt install wl-clipboard  (or equivalent)"
+        fi
+      else
+        # Check for real xclip (not our shim)
+        local real_xclip
+        if ! real_xclip=$(_find_real_xclip) 2>/dev/null; then
+          info "note: no real xclip found (shim handles image paste; text paste may need xclip)"
+          info "  install: sudo apt install xclip  (or equivalent)"
+        fi
+      fi
+      ;;
+    Darwin)
+      if ! command -v pngpaste >/dev/null 2>&1; then
+        info "note: pngpaste not found (using osascript fallback, which is slower)"
+        info "  install: brew install pngpaste"
+      fi
+      ;;
+  esac
+
+  # 3. Verify SSH reverse access (if in an SSH session)
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    local ip host
+    ip=$(ssh_source_ip)
+    host=$(resolve_host "$ip")
+    info "SSH source detected: $host ($ip)"
+    info "testing reverse SSH..."
+    if ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" 'echo ok' >/dev/null 2>&1; then
+      info "reverse SSH to $host: ok"
+      # Check if rpaste exists on source
+      if ssh -o BatchMode=yes -o ConnectTimeout=3 "$host" '
+        command -v rpaste >/dev/null 2>&1 || [ -x "$HOME/.local/bin/rpaste" ]
+      ' 2>/dev/null; then
+        info "rpaste on $host: found"
+      else
+        info "warning: rpaste not found on $host"
+        info "  install rpaste on $host too (it needs 'rpaste get' to extract clipboard)"
+      fi
+    else
+      info "warning: reverse SSH to $host failed"
+      info "  rpaste needs SSH access back to your local machine"
+    fi
+  else
+    info "not in SSH session — this machine is the clipboard source"
+  fi
+
+  info "done. run 'rpaste status' to verify."
+}
+
+# ---------------------------------------------------------------------------
 # Main dispatch
 # ---------------------------------------------------------------------------
 
@@ -346,20 +388,23 @@ rpaste — content bridge for pasting images into terminal agents over SSH
 Usage: rpaste <command> [args]
 
 Commands:
+  install          One-time setup: link into PATH, install shims, check deps
   get              Extract clipboard image → stdout (run on machine with display)
   stage            Read image from stdin → staging dir, print path
   pull [host]      Pull clipboard image from SSH source (or given host) → stage locally
-  inject [path]    Send staged image ref into current tmux pane's agent
-  paste [host]     Full flow: pull + inject (bind this to prefix+V)
+  paste [host]     Alias for pull (pull + stage, print path)
   serve [args]     Act as xclip shim (for Linux remotes)
   shim-install     Install xclip shim symlink in ~/.local/bin
   status           Show rpaste state
   clean [N]        Remove old staged images, keeping N most recent (default 10)
 
-The typical SSH workflow:
+Workflow:
   1. Copy/screenshot an image on your local machine
-  2. On the remote (in tmux): rpaste paste
-     — or bind it: bind V run-shell "rpaste paste"
+  2. On the remote: rpaste paste
+  3. Use the image:
+     - Linux: Ctrl+V in agent (xclip shim serves it)
+     - macOS: paste the printed path into the agent
+     - Any:   reference ~/.local/state/rpaste/images/latest.png
 
 For Linux remotes, install the xclip shim for transparent Ctrl+V:
   rpaste shim-install
@@ -378,10 +423,10 @@ fi
 cmd="$1"; shift
 
 case "$cmd" in
+  install)      cmd_install "$@" ;;
   get)          cmd_get "$@" ;;
   stage)        cmd_stage "$@" ;;
   pull)         cmd_pull "$@" ;;
-  inject)       cmd_inject "$@" ;;
   paste)        cmd_paste "$@" ;;
   serve)        cmd_serve "$@" ;;
   shim-install) cmd_shim_install "$@" ;;

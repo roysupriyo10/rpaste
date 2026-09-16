@@ -2,38 +2,53 @@
 
 Content bridge for pasting images into terminal AI agents over SSH.
 
-Copy an image on your local machine, press a tmux keybinding on the remote, and the agent sees it — no X server, no kitty, no special terminal required.
+Copy an image on your local machine, run `rpaste paste` on the remote, and the agent sees it — no X server, no special terminal required.
 
 ## The problem
 
-When you SSH into a remote machine and run an AI agent (Claude Code, Kiro CLI, etc.), you can't paste images. Terminals only carry text over SSH. Your clipboard is on your local machine; the agent is on the remote.
+When you SSH into a remote machine and run an AI agent (Claude Code, Kiro CLI, etc.), you can't paste images. Terminals only carry text. Your clipboard is on your local machine; the agent is on the remote.
 
 ## How it works
 
 ```
-You (thalia)                             Agent (minerva)
+You (local)                              Agent (remote)
   clipboard image                          rpaste paste
   ←── ssh rpaste get ──────────────────→   pulls image bytes
                                            stages to ~/.local/state/rpaste/
-                                           injects ref into agent pane
+                                           prints path
 ```
 
-`rpaste` is one script that does different things based on where it runs:
+`rpaste` is one script that does different things depending on where it runs:
 
-- **On your local machine** (`rpaste get`): extracts the clipboard image and writes it to stdout
-- **On the remote** (`rpaste paste`): SSHes back to your local machine, runs `rpaste get`, stages the image, and feeds it to the agent
+- **On your local machine** (`rpaste get`): extracts the clipboard image, writes to stdout
+- **On the remote** (`rpaste paste`): SSHes back to your machine, runs `rpaste get`, stages the image, prints the path
 
-## Setup
+On Linux remotes, an xclip shim makes agents' native Ctrl+V work transparently.
 
-### Install
+## Install
 
-Copy `rpaste` to `~/.local/bin/` on **both** your local machine and your remotes:
+Get rpaste on **both** your local machine and your remotes:
 
 ```bash
+# copy it
 cp rpaste ~/.local/bin/rpaste
+
+# or clone and link
+git clone https://github.com/roysupriyo10/rpaste.git
+ln -s $(pwd)/rpaste/rpaste ~/.local/bin/rpaste
 ```
 
-Or symlink it from your dotfiles.
+Then run the one-time setup:
+
+```bash
+rpaste install
+```
+
+This will:
+- Link rpaste into your PATH
+- Install the xclip shim (Linux only — makes Ctrl+V work in agents)
+- Check for clipboard tool dependencies
+- Verify reverse SSH access back to your local machine
 
 ### Dependencies
 
@@ -42,49 +57,38 @@ Or symlink it from your dotfiles.
 | OS | Tool | Install |
 |----|------|---------|
 | macOS | `pngpaste` (optional, osascript fallback exists) | `brew install pngpaste` |
-| Linux (Wayland) | `wl-paste` | Usually pre-installed with your compositor |
+| Linux (Wayland) | `wl-paste` | Usually pre-installed |
 | Linux (X11) | `xclip` | `sudo apt install xclip` |
 
-**Remote machine:** Nothing — just `rpaste` itself, `ssh`, and `tmux`.
+**Remote machine:** Nothing besides `rpaste` itself, `ssh`, and `bash`.
 
-### Tmux binding
-
-Add to your `~/.tmux.conf`:
-
-```tmux
-bind V run-shell "rpaste paste"
-```
-
-Now `prefix + V` pulls your local clipboard image and pastes it into whatever agent is in the active pane.
-
-### Linux xclip shim (optional)
-
-On **Linux** remotes, install the shim so agents' native Ctrl+V works transparently:
-
-```bash
-rpaste shim-install
-```
-
-This creates a symlink `~/.local/bin/xclip → rpaste`. When Claude Code calls `xclip -t image/png -o`, rpaste serves the staged image. Ensure `~/.local/bin` is before `/usr/bin` in your PATH.
-
-## Requirements
+### Requirements
 
 - SSH access **back** from the remote to your local machine (reverse SSH). Tailscale makes this trivial.
 - `rpaste` installed on both ends.
-- `tmux` on the remote (for injection).
+
+## Usage
+
+```bash
+# 1. Copy/screenshot an image on your local machine
+# 2. On the remote:
+rpaste paste
+
+# 3. Use the image:
+#    - Linux: Ctrl+V in agent (xclip shim serves it)
+#    - macOS: paste the printed path into the agent
+#    - Any:   reference ~/.local/state/rpaste/images/latest.png
+```
 
 ## Commands
 
 ```
+rpaste install          One-time setup: link into PATH, install shims, check deps
 rpaste get              Extract clipboard image → stdout
-rpaste stage            Read image from stdin → staging dir
-rpaste pull [host]      Pull clipboard from SSH source → stage locally
-rpaste inject [path]    Send image ref into current tmux pane
-rpaste paste [host]     Full flow: pull + inject
-rpaste serve [args]     xclip shim mode (called via symlink)
-rpaste shim-install     Install xclip shim in ~/.local/bin
+rpaste paste [host]     Pull clipboard from SSH source, stage locally, print path
 rpaste status           Show current state
 rpaste clean [N]        Remove old staged images (keep N, default 10)
+rpaste shim-install     Install xclip shim (called by install on Linux)
 ```
 
 ## How agents receive the image
@@ -92,9 +96,13 @@ rpaste clean [N]        Remove old staged images (keep N, default 10)
 | Agent | Remote OS | Method |
 |-------|-----------|--------|
 | Claude Code | Linux | Ctrl+V via xclip shim (transparent) |
-| Claude Code | macOS | Path injection (file path sent to prompt) |
-| Kiro CLI | any | `/paste` command |
-| Other agents | any | File path sent to prompt |
+| Claude Code | macOS | Paste the printed path into the prompt |
+| Kiro CLI | any | `/paste` or paste the path |
+| Other agents | any | Paste the path |
+
+## Terminal agnostic
+
+rpaste has zero terminal dependencies. It works with Alacritty, foot, Ghostty, iTerm2, kitty, WezTerm, xterm, or any other terminal. The transport is pure SSH; clipboard extraction uses OS-native tools.
 
 ## License
 
