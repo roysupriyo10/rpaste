@@ -5,6 +5,10 @@
 #import <objc/runtime.h>
 
 static NSString *rpaste_latest_path(void) {
+    const char *images = getenv("RPASTE_IMAGES_DIR");
+    if (images && *images) {
+        return [[NSString stringWithUTF8String:images] stringByAppendingPathComponent:@"latest.png"];
+    }
     const char *home = getenv("HOME");
     if (!home) return nil;
     NSString *xdg = nil;
@@ -20,9 +24,10 @@ static NSString *rpaste_latest_path(void) {
 static IMP original_dataForType = NULL;
 
 static NSData *swizzled_dataForType(id self, SEL _cmd, NSPasteboardType type) {
-    // Call original first
+    // Scoped agent environments prefer their own staged image over an
+    // unrelated GUI clipboard on the remote macOS machine.
     NSData *result = ((NSData *(*)(id, SEL, NSPasteboardType))original_dataForType)(self, _cmd, type);
-    if (result) return result;
+    if (result && !getenv("RPASTE_IMAGES_DIR")) return result;
 
     // No data from real pasteboard — check if rpaste has a staged image
     if ([type isEqualToString:NSPasteboardTypePNG] ||
@@ -47,12 +52,22 @@ static NSData *swizzled_dataForType(id self, SEL _cmd, NSPasteboardType type) {
     return result;
 }
 
-static NSArray *swizzled_types_orig = NULL;
 static IMP original_types = NULL;
+static IMP original_readObjects = NULL;
+
+static NSArray *swizzled_readObjects(id self, SEL _cmd, NSArray *classes, NSDictionary *options) {
+    // Codex prefers image files from NSURL clipboard entries before reading
+    // TIFF bytes. A scoped staged image must not lose to a remote GUI file.
+    if (getenv("RPASTE_IMAGES_DIR") && [classes containsObject:[NSURL class]]) {
+        NSString *path = rpaste_latest_path();
+        if (path && [[NSFileManager defaultManager] fileExistsAtPath:path]) return @[];
+    }
+    return ((NSArray *(*)(id, SEL, NSArray *, NSDictionary *))original_readObjects)(self, _cmd, classes, options);
+}
 
 static NSArray *swizzled_types(id self, SEL _cmd) {
     NSArray *result = ((NSArray *(*)(id, SEL))original_types)(self, _cmd);
-    if (result && result.count > 0) return result;
+    if (result && result.count > 0 && !getenv("RPASTE_IMAGES_DIR")) return result;
 
     // No types from real pasteboard — check rpaste
     NSString *path = rpaste_latest_path();
@@ -73,5 +88,10 @@ static void rpaste_inject_init(void) {
     if (t) {
         original_types = method_getImplementation(t);
         method_setImplementation(t, (IMP)swizzled_types);
+    }
+    Method r = class_getInstanceMethod([NSPasteboard class], @selector(readObjectsForClasses:options:));
+    if (r) {
+        original_readObjects = method_getImplementation(r);
+        method_setImplementation(r, (IMP)swizzled_readObjects);
     }
 }

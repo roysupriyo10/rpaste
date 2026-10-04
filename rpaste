@@ -13,11 +13,31 @@ RPASTE_IMAGES="$RPASTE_STATE/images"
 die()  { printf 'rpaste: %s\n' "$*" >&2; exit 1; }
 info() { printf 'rpaste: %s\n' "$*" >&2; }
 
-ensure_dirs() { mkdir -p "$RPASTE_IMAGES"; }
+ensure_dirs() { (umask 077; mkdir -p "$RPASTE_IMAGES"); }
 
-timestamp() { date +%Y%m%d-%H%M%S; }
+self_path() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}"
+}
+
+python_helper() {
+  local module=$1
+  shift
+  python3 "$(dirname "$(self_path)")/$module" "$@"
+}
 
 ssh_source_ip() {
+  # tmux refreshes this client environment when attaching. Its original server
+  # environment can belong to a different login or clipboard source.
+  local connection="${SSH_CONNECTION:-}"
+  if [ -n "${TMUX:-}" ] && [ "${RPASTE_CLIENT_CONTEXT:-}" != 1 ] && command -v tmux >/dev/null 2>&1; then
+    local current
+    current=$(tmux show-environment SSH_CONNECTION 2>/dev/null) || current=""
+    case "$current" in SSH_CONNECTION=*) connection=${current#SSH_CONNECTION=} ;; esac
+  fi
+  if [ -n "$connection" ]; then
+    printf '%s' "${connection%% *}"
+    return
+  fi
   # Prefer the utmpx database (via `who`) — it reflects the current TTY's
   # actual SSH session, not the possibly-stale inherited $SSH_CONNECTION.
   local cur_tty
@@ -27,17 +47,7 @@ ssh_source_ip() {
     ip=$(who | awk -v t="$cur_tty" '$2 == t {gsub(/[()]/, "", $NF); print $NF; exit}')
     [ -n "$ip" ] && { printf '%s' "$ip"; return; }
   fi
-  # No TTY (e.g. called from a pipe/shim) — try most recent SSH login from `who`
-  local ip
-  ip=$(who | awk '/\(/ {gsub(/[()]/, "", $NF); ip=$NF} END {if (ip) print ip}')
-  if [ -n "$ip" ]; then
-    printf '%s' "$ip"
-    return
-  fi
-  # Last resort: inherited env var (may be stale)
-  ip="${SSH_CONNECTION%% *}"
-  [ -n "$ip" ] || die "not in an SSH session"
-  printf '%s' "$ip"
+  die "cannot identify this SSH source; use rpaste pull user@host or RPASTE_HOST"
 }
 
 resolve_host() {
@@ -60,20 +70,27 @@ for a in d.get('Self', {}).get('TailscaleIPs', []):
   printf '%s' "$ip"
 }
 
-latest_image() {
-  local img="$RPASTE_IMAGES/latest.png"
-  [ -f "$img" ] && printf '%s' "$img"
-}
-
-_osc52_copy() {
-  local text=$1
-  local encoded
-  encoded=$(printf '%s' "$text" | base64 | tr -d '\n')
-  local tty_target="${SSH_TTY:-/dev/tty}"
-  if [ -n "${TMUX:-}" ]; then
-    printf '\ePtmux;\e\e]52;c;%s\a\e\\' "$encoded" > "$tty_target" 2>/dev/null || true
-  else
-    printf '\e]52;c;%s\a' "$encoded" > "$tty_target" 2>/dev/null || true
+linux_clipboard_env() {
+  # Reverse SSH does not carry the source desktop environment. Both image and
+  # text reads use the same recovery from Sway's systemd user environment.
+  if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    local session_env key value socket
+    session_env=$(systemctl --user show-environment 2>/dev/null) || session_env=""
+    while IFS='=' read -r key value; do
+      case "$key" in
+        WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR|XAUTHORITY) export "$key=$value" ;;
+      esac
+    done <<< "$session_env"
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+      export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    fi
+    if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+      for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        [ -S "$socket" ] || continue
+        export WAYLAND_DISPLAY="${socket##*/}"
+        break
+      done
+    fi
   fi
 }
 
@@ -83,6 +100,9 @@ _osc52_copy() {
 # ---------------------------------------------------------------------------
 
 cmd_get() {
+  # This command must read the actual source clipboard, never staged remote
+  # data or the injection library inherited from an agent's environment.
+  unset DYLD_INSERT_LIBRARIES
   case "$(uname -s)" in
     Darwin)
       local console_user
@@ -102,23 +122,29 @@ cmd_get() {
         return
       fi
 
-      if command -v pngpaste >/dev/null 2>&1; then
+      if [ -x "$RPASTE_STATE/rpaste-get" ]; then
+        "$RPASTE_STATE/rpaste-get" || die "no image in clipboard"
+      elif command -v pngpaste >/dev/null 2>&1; then
         pngpaste - 2>/dev/null || die "no image in clipboard"
       else
-        swift -e '
-          import AppKit
-          guard let data = NSPasteboard.general.data(forType: .png) else {
-            fputs("rpaste: no image in clipboard\n", stderr); exit(1)
-          }
-          FileHandle.standardOutput.write(data)
-        ' 2>/dev/null || die "no image in clipboard"
+        # AppleScript is built into macOS; no Swift runtime or pngpaste install
+        # is needed for the default path delivery method.
+        osascript -e 'the clipboard as «class PNGf»' 2>/dev/null | python3 -c '
+import re,sys
+match=re.fullmatch(r"«data PNGf([0-9a-fA-F]+)»", sys.stdin.read().strip())
+if not match: sys.exit(1)
+sys.stdout.buffer.write(bytes.fromhex(match.group(1)))
+' || die "no image in clipboard"
       fi
       ;;
     Linux)
+      linux_clipboard_env
       if [ -n "${WAYLAND_DISPLAY:-}" ]; then
         wl-paste -t image/png 2>/dev/null || die "no image in clipboard (wl-paste)"
       else
-        xclip -selection clipboard -t image/png -o 2>/dev/null || die "no image in clipboard (xclip)"
+        local real_xclip
+        real_xclip=$(_find_real_xclip) || die "xclip is missing; run dotfiles/install.sh"
+        "$real_xclip" -selection clipboard -t image/png -o 2>/dev/null || die "no image in clipboard (xclip)"
       fi
       ;;
     *)
@@ -134,12 +160,54 @@ cmd_get() {
 # ---------------------------------------------------------------------------
 
 cmd_stage() {
+  python_helper rpaste_image.py "$RPASTE_STATE"
+}
+
+cmd_get_text() {
+  unset DYLD_INSERT_LIBRARIES
+  case "$(uname -s)" in
+    Darwin) pbpaste ;;
+    Linux)
+      linux_clipboard_env
+      if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        wl-paste --no-newline --type text
+      else
+        local real_xclip
+        real_xclip=$(_find_real_xclip) || return 1
+        "$real_xclip" -selection clipboard -t UTF8_STRING -o
+      fi
+      ;;
+    *) die "unsupported clipboard platform" ;;
+  esac
+}
+
+cmd_pull_text() {
+  if [ -n "${RPASTE_SOCKET:-}" ] && [ -z "${RPASTE_HOST:-}" ]; then
+    python_helper rpaste_transport.py fetch "$RPASTE_SOCKET" --text
+    return
+  fi
+  local host="${RPASTE_HOST:-}"
+  if [ -z "$host" ]; then
+    host=$(resolve_host "$(ssh_source_ip)")
+  fi
+  [[ "$host" != -* ]] || die "invalid SSH host: $host"
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+    if command -v rpaste >/dev/null 2>&1; then rpaste get-text
+    else "$HOME/.local/bin/rpaste" get-text
+    fi
+  '
+}
+
+cmd_local() {
   ensure_dirs
-  local name="clipboard-$(timestamp).png"
-  local dest="$RPASTE_IMAGES/$name"
-  cat > "$dest"
-  [ -s "$dest" ] || { rm -f "$dest"; die "staged file is empty"; }
-  ln -sf "$dest" "$RPASTE_IMAGES/latest.png"
+  local incoming dest
+  incoming=$(mktemp "$RPASTE_STATE/incoming-XXXXXX")
+  if ! (cmd_get) > "$incoming"; then
+    rm -f "$incoming"
+    return 1
+  fi
+  dest=$(cmd_stage < "$incoming") || { rm -f "$incoming"; return 1; }
+  rm -f "$incoming"
   printf '%s' "$dest"
 }
 
@@ -149,10 +217,23 @@ cmd_stage() {
 # ---------------------------------------------------------------------------
 
 cmd_pull() {
-  local host="${1:-}"
+  local host="${1:-${RPASTE_HOST:-}}"
+  local incoming dest
+  ensure_dirs
+  incoming=$(mktemp "$RPASTE_STATE/incoming-XXXXXX")
+  if [ -z "$host" ] && [ -n "${RPASTE_SOCKET:-}" ]; then
+    if ! python_helper rpaste_transport.py fetch "$RPASTE_SOCKET" > "$incoming"; then
+      rm -f "$incoming"
+      return 1
+    fi
+    dest=$(cmd_stage < "$incoming") || { rm -f "$incoming"; return 1; }
+    rm -f "$incoming"
+    printf '%s' "$dest"
+    return
+  fi
   if [ -z "$host" ]; then
     local ip
-    ip=$(ssh_source_ip)
+    ip=$(ssh_source_ip) || { rm -f "$incoming"; return 1; }
     host=$(resolve_host "$ip")
   fi
   info "pulling clipboard from $host"
@@ -163,9 +244,13 @@ cmd_pull() {
     else echo "rpaste: not found on remote" >&2; exit 1
     fi
   '
-  local dest
-  dest=$(ssh "$host" "$remote_cmd" 2>/dev/null | cmd_stage) \
-    || die "failed to pull clipboard from $host"
+  [[ "$host" != -* ]] || die "invalid SSH host: $host"
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$remote_cmd" > "$incoming"; then
+    rm -f "$incoming"
+    die "failed to pull clipboard from $host (check reverse SSH user and access)"
+  fi
+  dest=$(cmd_stage < "$incoming") || { rm -f "$incoming"; return 1; }
+  rm -f "$incoming"
   info "staged: $dest"
   printf '%s' "$dest"
 }
@@ -178,9 +263,36 @@ cmd_pull() {
 cmd_paste() {
   local host="${1:-}"
   local img
-  img=$(cmd_pull "$host")
-  _osc52_copy "$img"
-  info "image staged — Ctrl+V to paste into agent"
+  if [ -n "$host" ] || [ -n "${RPASTE_HOST:-}" ] || [ -n "${SSH_CONNECTION:-}" ] || [ -n "${RPASTE_SOCKET:-}" ]; then
+    img=$(cmd_pull "$host")
+  else
+    img=$(cmd_local)
+  fi
+  if [ "$(uname -s)" = Linux ] && [ -n "${SSH_CONNECTION:-}" ]; then
+    cmd_publish "$img" "${RPASTE_NATIVE_STATE:-$RPASTE_STATE}"
+  fi
+  # Do not replace the source clipboard with a path: that destroys the image
+  # and makes the next pull fail. Agents read the image from their clipboard.
+  printf '%s\n' "$img"
+  info "image staged (inside tmux, use Ctrl+V or prefix+v to attach)"
+}
+
+cmd_run() {
+  [ "${1:-}" != -- ] || shift
+  [ "$#" -gt 0 ] || die "usage: rpaste run -- command [args...]"
+  exec python3 "$(dirname "$(self_path)")/rpaste_agent.py" "$RPASTE_STATE" "$@"
+}
+
+cmd_publish() {
+  local image=$1 state=${2:-${RPASTE_NATIVE_STATE:-$RPASTE_STATE}}
+  case "$(uname -s)" in
+    Linux) python_helper rpaste_display.py publish "$state" "$image" ;;
+    Darwin)
+      mkdir -p "$state/images"
+      ln -sf "$image" "$state/images/latest.png"
+      ;;
+    *) die "native clipboard supports Linux and macOS" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -189,6 +301,14 @@ cmd_paste() {
 # ---------------------------------------------------------------------------
 
 cmd_serve() {
+  # Native agents use a real private X11 clipboard. Local desktop reads also
+  # bypass staging, so an old image never shadows the local clipboard.
+  if [ -n "${RPASTE_NATIVE_STATE:-}" ] || [ -z "${SSH_CONNECTION:-}" ]; then
+    local real_xclip
+    real_xclip=$(_find_real_xclip) || return 1
+    "$real_xclip" "$@"
+    return
+  fi
   local args=("$@")
   local mode=""
   local type=""
@@ -215,7 +335,7 @@ cmd_serve() {
           printf 'TARGETS\ntext/plain\n'
         fi
         ;;
-      image/png|image/jpeg|image/jpg|image/gif|image/webp|image/bmp)
+      image/png)
         local img="$RPASTE_IMAGES/latest.png"
         [ -f "$img" ] || exit 1
         cat "$img"
@@ -241,15 +361,7 @@ cmd_serve() {
 }
 
 _find_real_xclip() {
-  local self
-  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "")
-  local p
-  while IFS= read -r p; do
-    local real
-    real=$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null || echo "$p")
-    [ "$real" != "$self" ] && { printf '%s' "$p"; return 0; }
-  done < <(which -a xclip 2>/dev/null)
-  return 1
+  python_helper rpaste_display.py real-xclip
 }
 
 # ---------------------------------------------------------------------------
@@ -260,7 +372,7 @@ _find_real_xclip() {
 cmd_shim_install() {
   local bin_dir="${1:-$HOME/.local/bin}"
   local self
-  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+  self=$(self_path)
   mkdir -p "$bin_dir"
 
   case "$(uname -s)" in
@@ -290,32 +402,30 @@ _install_shim() {
 # Compile the DYLD_INSERT_LIBRARIES dylib for macOS NSPasteboard interception.
 # ---------------------------------------------------------------------------
 
+compile_if_stale() {
+  local src=$1 dest=$2 temporary
+  shift 2
+  [ -f "$src" ] || die "build source is missing: $src"
+  [ ! -f "$dest" ] || [ ! "$dest" -nt "$src" ] || return 0
+  temporary=$(mktemp "$RPASTE_STATE/build-XXXXXX")
+  if clang "$@" -framework AppKit -o "$temporary" "$src"; then
+    chmod 700 "$temporary"
+    mv "$temporary" "$dest"
+    info "built: $dest"
+  else
+    rm -f "$temporary"
+    die "native build failed (Xcode CLT required)"
+  fi
+}
+
 cmd_inject_build() {
   [ "$(uname -s)" = "Darwin" ] || { info "inject-build is macOS only"; return 0; }
 
   local rpaste_dir
-  rpaste_dir=$(dirname "$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")")
-  local src="$rpaste_dir/rpaste-inject.m"
-  local dylib="$RPASTE_STATE/rpaste-inject.dylib"
-
+  rpaste_dir=$(dirname "$(self_path)")
   mkdir -p "$RPASTE_STATE"
-
-  if [ ! -f "$src" ]; then
-    info "rpaste-inject.m not found (skip dylib build)"
-    return 0
-  fi
-
-  if [ -f "$dylib" ] && [ "$dylib" -nt "$src" ]; then
-    info "dylib up to date: $dylib"
-  else
-    info "building dylib..."
-    if clang -shared -framework AppKit -o "$dylib" "$src" 2>/dev/null; then
-      info "built: $dylib"
-    else
-      info "warning: dylib build failed (Xcode CLT required)"
-      return 0
-    fi
-  fi
+  compile_if_stale "$rpaste_dir/rpaste-inject.m" "$RPASTE_STATE/rpaste-inject.dylib" -dynamiclib
+  compile_if_stale "$rpaste_dir/rpaste-get.m" "$RPASTE_STATE/rpaste-get"
 }
 
 # ---------------------------------------------------------------------------
@@ -360,7 +470,7 @@ _inject_env_remove() {
       local tmp="$rc.rpaste-bak"
       # Remove the marker line and the following 3 lines (the if/export/fi block)
       awk -v marker="$_RPASTE_PROFILE_MARKER" '
-        $0 ~ marker { skip=4; next }
+        $0 ~ marker { skip=3; next }
         skip > 0 { skip--; next }
         { print }
       ' "$rc" > "$tmp" && mv "$tmp" "$rc"
@@ -375,6 +485,10 @@ _inject_env_remove() {
 
 cmd_status() {
   printf 'rpaste state dir: %s\n' "$RPASTE_STATE"
+  printf 'socket tunnel:    %s\n' "${RPASTE_SOCKET:-(none; reverse SSH fallback)}"
+  if [ -n "${TMUX:-}" ]; then
+    printf 'tmux method:      %s\n' "$(tmux show-options -qv @rpaste-method 2>/dev/null || true)"
+  fi
   if [ -f "$RPASTE_IMAGES/latest.png" ]; then
     local size
     size=$(wc -c < "$RPASTE_IMAGES/latest.png" | tr -d ' ')
@@ -440,9 +554,18 @@ cmd_clean() {
 # ---------------------------------------------------------------------------
 
 cmd_install() {
-  local bin_dir="${1:-$HOME/.local/bin}"
+  local bin_dir="$HOME/.local/bin" profile=1 check=1 native=1
+  for arg in "$@"; do
+    case "$arg" in
+      --no-profile) profile=0 ;;
+      --no-check) check=0 ;;
+      --no-native) native=0 ;;
+      --*) die "unknown install option: $arg" ;;
+      *) bin_dir=$arg ;;
+    esac
+  done
   local self
-  self=$(realpath "${BASH_SOURCE[0]}" 2>/dev/null || readlink -f "${BASH_SOURCE[0]}")
+  self=$(self_path)
 
   ensure_dirs
 
@@ -451,13 +574,16 @@ cmd_install() {
   local link="$bin_dir/rpaste"
   if [ -L "$link" ] && [ "$(realpath "$link" 2>/dev/null)" = "$self" ]; then
     info "rpaste already in $bin_dir"
+  elif [ -d "$link" ]; then
+    die "$link is a directory; refusing to nest the rpaste link inside it"
   else
     ln -sf "$self" "$link"
     info "linked: $link → $self"
   fi
 
-  # 2. Platform-specific setup
-  case "$(uname -s)" in
+  # 2. Optional native setup (the dotfiles installer handles dependencies).
+  if [ "$native" = 1 ]; then
+    case "$(uname -s)" in
     Linux)
       cmd_shim_install "$bin_dir"
       if [ -n "${WAYLAND_DISPLAY:-}" ]; then
@@ -467,12 +593,16 @@ cmd_install() {
       ;;
     Darwin)
       cmd_inject_build
-      _inject_env_install
+      [ "$profile" = 0 ] || _inject_env_install
       ;;
   esac
+  fi
 
   # 3. Verify SSH reverse access (if in an SSH session)
-  if [ -n "${SSH_CONNECTION:-}" ]; then
+  if [ "$check" = 0 ]; then
+    info "setup complete"
+    return
+  elif [ -n "${SSH_CONNECTION:-}" ]; then
     local ip host
     ip=$(ssh_source_ip)
     host=$(resolve_host "$ip")
@@ -550,7 +680,11 @@ Commands:
   get              Extract clipboard image → stdout (run on machine with display)
   stage            Read image from stdin → staging dir, print path
   pull [host]      Pull clipboard image from SSH source (or given host) → stage
-  paste [host]     Pull + stage + copy path to text clipboard
+  local            Stage the clipboard on this machine, print the image path
+  paste [host]     Pull + stage + publish to the optional native clipboard
+  ssh [opts] host  Open an interactive SSH shell with a clipboard socket tunnel
+  run -- command  Launch an agent with tmux registration and optional native support
+  tmux-paste      Deliver to a pane (called by the tmux bindings)
   serve [args]     Act as xclip shim (called when symlinked as xclip)
   shim-install     Install xclip shim symlink (Linux only)
   inject-build     Build the NSPasteboard dylib (macOS only)
@@ -558,20 +692,13 @@ Commands:
   status           Show rpaste state
   clean [N]        Remove old staged images, keeping N most recent (default 10)
 
-How it works:
-  macOS remote:  DYLD_INSERT_LIBRARIES loads a dylib that makes NSPasteboard
-                 fall back to rpaste's staged image when the real pasteboard
-                 is empty. Set automatically in SSH sessions by rpaste install.
-  Linux remote:  xclip shim symlink intercepts clipboard reads and serves
-                 the staged image. Bun.Image returns null on Linux, so
-                 Claude Code falls back to xclip which hits the shim.
-
 Workflow:
-  1. Copy/screenshot an image on your local machine
-  2. On the remote: rpaste paste
-  3. Ctrl+V in the agent — the image is available
+  1. Connect with rssh user@host (or use existing reverse SSH access).
+  2. Start Claude Code or Codex inside tmux; copy an image locally.
+  3. Ctrl+V uses @rpaste-method; prefix+v forces path; prefix+V forces native.
+  Native support is optional: dotfiles/install.sh --rpaste-native, restart agent.
 EOF
-  exit 1
+  return 0
 }
 
 # Handle being called as xclip shim (symlink named 'xclip' pointing to rpaste)
@@ -581,16 +708,26 @@ if [ "$called_as" = "xclip" ]; then
   exit $?
 fi
 
-[ $# -ge 1 ] || usage
+[ $# -ge 1 ] || { usage; exit 1; }
 cmd="$1"; shift
 
 case "$cmd" in
   install)      cmd_install "$@" ;;
   uninstall)    cmd_uninstall "$@" ;;
   get)          cmd_get "$@" ;;
+  get-text)     cmd_get_text "$@" ;;
+  pull-text)    cmd_pull_text "$@" ;;
+  local)        cmd_local "$@" ;;
   stage)        cmd_stage "$@" ;;
   pull)         cmd_pull "$@" ;;
   paste)        cmd_paste "$@" ;;
+  run)          cmd_run "$@" ;;
+  publish)      cmd_publish "$@" ;;
+  real-xclip)   _find_real_xclip ;;
+  tmux-paste)   python_helper rpaste_tmux.py "$@" ;;
+  ssh)          python_helper rpaste_transport.py ssh "$RPASTE_STATE/source.sock" "$(self_path)" "$@" ;;
+  ssh-auto)     python_helper rpaste_transport.py ssh-auto "$RPASTE_STATE/source.sock" "$(self_path)" "$@" ;;
+  kitty-ssh)     python_helper rpaste_transport.py kitty-ssh "$RPASTE_STATE/source.sock" "$(self_path)" "$@" ;;
   serve)        cmd_serve "$@" ;;
   shim-install) cmd_shim_install "$@" ;;
   inject-build) cmd_inject_build "$@" ;;
