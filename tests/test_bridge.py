@@ -257,6 +257,25 @@ class TmuxTests(ScratchTest):
 
 
 class DeliveryTests(ScratchTest):
+    def test_expected_clipboard_failure_keeps_its_explanation_visible(self):
+        error = RuntimeError(
+            "rpaste: pulling clipboard from source\nrpaste: no image in clipboard (xclip)"
+        )
+        with patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 0)
+        ) as run, patch("sys.stderr", new=io.StringIO()) as stderr:
+            self.assertTrue(rpaste_tmux.report_error(error, "%28"))
+        self.assertIn("no image in clipboard", run.call_args.args[0][-1])
+        self.assertNotIn("rpaste: rpaste:", stderr.getvalue())
+
+    def test_reporting_failure_retains_nonzero_status(self):
+        with patch.object(
+            subprocess, "run", return_value=subprocess.CompletedProcess([], 1)
+        ), patch("sys.stderr", new=io.StringIO()):
+            self.assertFalse(
+                rpaste_tmux.report_error(RuntimeError("source unreachable"), "%28")
+            )
+
     def test_native_mode_requires_registered_clipboard_before_sending_key(self):
         with patch.object(rpaste_tmux, "tmux") as tmux, self.assertRaisesRegex(
             RuntimeError, "--rpaste-native"

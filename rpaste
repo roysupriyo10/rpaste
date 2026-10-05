@@ -181,6 +181,50 @@ cmd_get_text() {
   esac
 }
 
+remote_clipboard_command() {
+  # Older source installations choose X11 in a noninteractive SSH shell even
+  # when their desktop uses Wayland. Recover the GUI environment remotely
+  # before calling their existing image reader; no source files are changed.
+  cat <<'REMOTE'
+if [ "$(uname -s)" = Linux ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      WAYLAND_DISPLAY|DISPLAY|XDG_RUNTIME_DIR|XAUTHORITY) export "$key=$value" ;;
+    esac
+  done <<RPASTE_ENV
+$(systemctl --user show-environment 2>/dev/null)
+RPASTE_ENV
+fi
+REMOTE
+  case "$1" in
+    get)
+      cat <<'REMOTE'
+if command -v rpaste >/dev/null 2>&1; then rpaste get
+elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
+else echo "rpaste: not found on source" >&2; exit 1
+fi
+REMOTE
+      ;;
+    get-text)
+      # get-text was added with the tunnel implementation, so an older source
+      # must use its native clipboard command directly for ordinary text.
+      cat <<'REMOTE'
+case "$(uname -s)" in
+  Darwin) pbpaste ;;
+  Linux)
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      wl-paste --no-newline --type text
+    else
+      xclip -selection clipboard -t UTF8_STRING -o
+    fi
+    ;;
+  *) echo "rpaste: unsupported source clipboard platform" >&2; exit 1 ;;
+esac
+REMOTE
+      ;;
+  esac
+}
+
 cmd_pull_text() {
   if [ -n "${RPASTE_SOCKET:-}" ] && [ -z "${RPASTE_HOST:-}" ]; then
     python_helper rpaste_transport.py fetch "$RPASTE_SOCKET" --text
@@ -191,11 +235,7 @@ cmd_pull_text() {
     host=$(resolve_host "$(ssh_source_ip)")
   fi
   [[ "$host" != -* ]] || die "invalid SSH host: $host"
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
-    if command -v rpaste >/dev/null 2>&1; then rpaste get-text
-    else "$HOME/.local/bin/rpaste" get-text
-    fi
-  '
+  ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$(remote_clipboard_command get-text)"
 }
 
 cmd_local() {
@@ -238,12 +278,8 @@ cmd_pull() {
   fi
   info "pulling clipboard from $host"
 
-  local remote_cmd='
-    if command -v rpaste >/dev/null 2>&1; then rpaste get
-    elif [ -x "$HOME/.local/bin/rpaste" ]; then "$HOME/.local/bin/rpaste" get
-    else echo "rpaste: not found on remote" >&2; exit 1
-    fi
-  '
+  local remote_cmd
+  remote_cmd=$(remote_clipboard_command get)
   [[ "$host" != -* ]] || die "invalid SSH host: $host"
   if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" "$remote_cmd" > "$incoming"; then
     rm -f "$incoming"

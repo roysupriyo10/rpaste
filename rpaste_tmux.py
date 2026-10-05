@@ -152,6 +152,29 @@ def paste_native(bridge, pane, registration, image, environment):
     tmux("send-keys", "-t", pane, "C-v")
 
 
+def report_error(error, pane):
+    """Leave the actionable error visible instead of tmux's generic exit code."""
+    detail = (
+        error.stderr.decode(errors="replace").strip()
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr
+        else str(error)
+    )
+    lines = [line.removeprefix("rpaste: ").strip() for line in detail.splitlines()]
+    message = "rpaste: " + " | ".join(line for line in lines if line)
+    message = message[:500]
+    print(message, file=sys.stderr)
+    if not pane:
+        return False
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", pane, "-d", "10000", "--", message],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # A reported GUI failure is already delivered to the user. Returning 1
+    # here makes run-shell replace that message with "command returned 1".
+    return result.returncode == 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pane", required=True)
@@ -220,19 +243,5 @@ if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        detail = (
-            error.stderr.decode(errors="replace").strip()
-            if isinstance(error, subprocess.CalledProcessError) and error.stderr
-            else str(error)
-        )
-        message = f"rpaste: {detail}".replace("\n", " ")[:500]
-        # A tmux status message leaves the user's draft and terminal untouched.
         pane = sys.argv[sys.argv.index("--pane") + 1] if "--pane" in sys.argv else None
-        if pane:
-            subprocess.run(
-                ["tmux", "display-message", "-t", pane, "-d", "6000", "--", message],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        print(message, file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0 if report_error(error, pane) else 1)

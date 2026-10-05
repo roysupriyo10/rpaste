@@ -87,6 +87,11 @@ rpaste uses the triggering client's SSH source address. This fallback needs
 working noninteractive SSH access to your desktop. The automatic socket tunnel avoids that
 separate authentication and preserves the source's desktop environment.
 
+The fallback also recovers a Linux source's GUI environment before invoking
+older rpaste image readers. Text reads use the source's native clipboard tool,
+so they do not require an updated `get-text` command on that machine. Clipboard
+errors remain visible in tmux rather than being replaced by a generic exit code.
+
 ## Commands
 
 ```sh

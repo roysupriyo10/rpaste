@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -127,6 +128,54 @@ class AutomaticSshTests(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments):
                 self.assertFalse(interactive_shell(arguments))
+
+
+class OlderWaylandSourceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="rpaste-old-source-test-")
+        self.root = Path(self.directory.name)
+        self.addCleanup(self.directory.cleanup)
+        client = self.root / "client"
+        source = self.root / "source"
+        client.mkdir()
+        source.mkdir()
+        self.image = self.root / "source.png"
+        self.image.write_bytes(png())
+        programs = {
+            source
+            / "systemctl": '#!/bin/sh\nprintf "WAYLAND_DISPLAY=wayland-test\\nXDG_RUNTIME_DIR=/tmp/rpaste-runtime\\nDISPLAY=:99\\n"\n',
+            source
+            / "rpaste": f'#!/bin/sh\n[ "$1" = get ] || exit 42\n[ "$WAYLAND_DISPLAY" = wayland-test ] || exit 43\n/bin/cat "{self.image}"\n',
+            source
+            / "wl-paste": '#!/bin/sh\n[ "$WAYLAND_DISPLAY" = wayland-test ] || exit 44\nprintf "ordinary clipboard text"\n',
+            client
+            / "ssh": f'#!{sys.executable}\nimport os,subprocess,sys\nenv=os.environ.copy()\nenv["PATH"]={str(source)!r}+os.pathsep+env["PATH"]\nsys.exit(subprocess.call(["/bin/sh","-c",sys.argv[-1]],env=env))\n',
+        }
+        for executable, body in programs.items():
+            executable.write_text(body)
+            executable.chmod(0o700)
+        self.env = os.environ.copy()
+        for key in ("WAYLAND_DISPLAY", "DISPLAY", "RPASTE_SOCKET"):
+            self.env.pop(key, None)
+        self.env.update(
+            PATH=str(client) + os.pathsep + self.env["PATH"],
+            RPASTE_HOST="source",
+            XDG_STATE_HOME=str(self.root / "state"),
+        )
+
+    def test_older_source_receives_desktop_environment_before_image_read(self):
+        result = subprocess.run(
+            [str(REPO / "rpaste"), "pull"], env=self.env, capture_output=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.decode()).read_bytes(), png())
+
+    def test_text_works_without_get_text_on_the_source(self):
+        result = subprocess.run(
+            [str(REPO / "rpaste"), "pull-text"], env=self.env, capture_output=True
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, b"ordinary clipboard text")
 
 
 if __name__ == "__main__":
